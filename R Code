@@ -971,3 +971,185 @@ all_sheets <- list(
 )
 writexl::write_xlsx(all_sheets, path = xlsx_path)
 cat("\n=== COPULASTEP8: Excel workbook written ===\n", xlsx_path, "\n", length(all_sheets), " sheets. Upload this file to review all results.\n", sep = "")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# COPULASTEP_MULTIVAR - Multivariate fidelity check (all 4 variables, not just yield)
+# Self-contained: does not depend on any other script. Just run this file alone.
+# Produces ONE Excel file: multivar_fidelity_results.xlsx
+# ============================================================
+
+# --- 0. Data directory: try base_dir1 first, fall back to base_dir2 ---
+base_dir1 <- "C:/Users/Alper.Tosun/Desktop/cru130"
+base_dir2 <- "C:/Users/autos/OneDrive/Desktop/cru130"
+if (dir.exists(base_dir1)) {
+  DATA_DIR <- base_dir1
+} else if (dir.exists(base_dir2)) {
+  DATA_DIR <- base_dir2
+} else {
+  stop("Neither base_dir1 nor base_dir2 exists. Please check the panel file location.")
+}
+OUT_DIR <- file.path(DATA_DIR, "copulapaper")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+cat("Using data directory:", DATA_DIR, "\n")
+cat("Output directory:", OUT_DIR, "\n")
+
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+if (!requireNamespace("writexl", quietly = TRUE)) install.packages("writexl")
+
+CROPS <- c("wheat","barley","maize","oats","rice","rye","sorghum","soybean")
+VARS  <- c("yield_hg_per_ha", "TMX_ann", "PRE_ann", "GDP_per_Capita")
+N_SEEDS <- 50                       # same replication count as the main paper results
+DEFAULT_SHRINKAGE  <- 1.0           # matches the paper's chosen hierarchical-copula default
+DEFAULT_BLOCK_LEN  <- 8             # matches the paper's chosen MBB default
+
+# --- 1. Load one crop's panel file (.xlsx) ---
+load_crop <- function(crop_name) {
+  path <- file.path(DATA_DIR, paste0("panelv7_", crop_name, ".xlsx"))
+  df <- as.data.frame(readxl::read_excel(path))
+  df$GDP_per_Capita[is.na(df$GDP_per_Capita)] <- median(df$GDP_per_Capita, na.rm = TRUE)
+  df
+}
+
+# Standardizes a variable WITHIN each country (used to estimate cross-variable dependence
+# without confounding it with between-country level differences)
+std_within <- function(x, g) ave(x, g, FUN = function(v) {
+  s <- sd(v); if (is.na(s) || s == 0) return(rep(NA, length(v))); (v - mean(v)) / s
+})
+safe_chol <- function(R) tryCatch(chol(R), error = function(e) chol(R + diag(1e-6, ncol(R))))
+acf1_by_country <- function(x, g) sapply(split(x, g), function(v) if (length(v) < 5) NA else acf(v, plot = FALSE, lag.max = 1)$acf[2])
+
+to_normal_scores <- function(x) qnorm(rank(x, ties.method = "average") / (length(x) + 1))
+inverse_ecdf <- function(u, original_x) quantile(original_x, probs = pmin(pmax(u, 1e-6), 1 - 1e-6), type = 7, names = FALSE)
+
+# --- 2. The three generators (identical specification to the main paper) ---
+
+generate_pooled_copula <- function(df, seed) {
+  set.seed(seed)
+  n <- nrow(df)
+  Z <- as.data.frame(lapply(df[VARS], to_normal_scores))
+  R <- cor(Z); L <- safe_chol(R)
+  Znew <- matrix(rnorm(n * length(VARS)), nrow = n) %*% L; colnames(Znew) <- VARS
+  syn <- as.data.frame(lapply(VARS, function(v) inverse_ecdf(pnorm(Znew[, v]), df[[v]])))
+  colnames(syn) <- VARS
+  syn$Country_ISO <- df$Country_ISO
+  syn
+}
+
+generate_hierarchical_copula <- function(df, seed, shrinkage = DEFAULT_SHRINKAGE) {
+  set.seed(seed)
+  Zw <- as.data.frame(lapply(df[VARS], std_within, g = df$Country_ISO))
+  R <- cor(Zw, use = "pairwise.complete.obs"); L <- safe_chol(R)
+  acf1_mat <- sapply(VARS, function(v) acf1_by_country(df[[v]], df$Country_ISO))
+  gen_one <- function(cid) {
+    sub <- df[df$Country_ISO == cid, ]; Ti <- nrow(sub)
+    means <- sapply(sub[VARS], mean); sds <- sapply(sub[VARS], sd)
+    phi_vec <- shrinkage * ifelse(is.na(acf1_mat[cid, ]), 0, acf1_mat[cid, ])
+    eps <- matrix(rnorm(Ti * length(VARS)), nrow = Ti) %*% L
+    X <- matrix(0, nrow = Ti, ncol = length(VARS)); X[1, ] <- eps[1, ]
+    if (Ti > 1) for (t in 2:Ti) X[t, ] <- phi_vec * X[t-1, ] + sqrt(pmax(1 - phi_vec^2, 0.01)) * eps[t, ]
+    Xs <- sweep(sweep(X, 2, sds, `*`), 2, means, `+`); colnames(Xs) <- VARS
+    data.frame(Country_ISO = cid, Xs)
+  }
+  syn <- do.call(rbind, lapply(unique(df$Country_ISO), gen_one))
+  syn$yield_hg_per_ha[syn$yield_hg_per_ha <= 0] <- 1
+  syn
+}
+
+generate_mbb <- function(df, seed, block_len = DEFAULT_BLOCK_LEN) {
+  set.seed(seed)
+  mbb_one <- function(sub) {
+    Ti <- nrow(sub)
+    if (Ti <= block_len) return(sub[sample(1:Ti, Ti, replace = TRUE), ])
+    n_blocks <- ceiling(Ti / block_len)
+    starts <- sample(1:(Ti - block_len + 1), n_blocks, replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) s:(s + block_len - 1)))[1:Ti]
+    sub[idx, ]
+  }
+  do.call(rbind, lapply(split(df, df$Country_ISO), mbb_one))
+}
+
+# --- 3. Fidelity metrics for ALL FOUR variables (not just yield) ---
+
+# KS statistic per variable
+ks_all_vars <- function(df_real, df_syn) {
+  sapply(VARS, function(v) unname(suppressWarnings(ks.test(df_real[[v]], df_syn[[v]])$statistic)))
+}
+
+# Cross-variable correlation error: mean absolute difference between the real and synthetic
+# pooled correlation matrices, averaged over the 6 off-diagonal variable pairs
+corr_error <- function(df_real, df_syn) {
+  R_real <- cor(df_real[VARS]); R_syn <- cor(df_syn[VARS])
+  idx <- upper.tri(R_real)
+  mean(abs(R_real[idx] - R_syn[idx]))
+}
+
+run_multivar_fidelity <- function(crop_name, generator_fun, generator_label, ...) {
+  df <- load_crop(crop_name)
+  results <- lapply(1:N_SEEDS, function(s) {
+    syn <- generator_fun(df, seed = s, ...)
+    c(ks_all_vars(df, syn), corr_error = corr_error(df, syn))
+  })
+  m <- rowMeans(do.call(cbind, results))
+  data.frame(crop = crop_name, generator = generator_label,
+             ks_yield = round(m["yield_hg_per_ha"], 4), ks_TMX = round(m["TMX_ann"], 4),
+             ks_PRE = round(m["PRE_ann"], 4), ks_GDP = round(m["GDP_per_Capita"], 4),
+             mean_corr_error = round(m["corr_error"], 4))
+}
+
+# --- 4. Run for all 8 crops x 3 generators ---
+cat("\nRunning multivariate fidelity check (", N_SEEDS, " seeds per crop/generator)...\n", sep = "")
+all_results <- list()
+for (cr in CROPS) {
+  cat("  ", cr, "...\n")
+  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_pooled_copula, "pooled")
+  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_hierarchical_copula, "hierarchical")
+  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_mbb, "mbb")
+}
+results_long <- do.call(rbind, all_results)
+cat("\n=== Multivariate fidelity results (all crops, all generators) ===\n")
+print(results_long, row.names = FALSE)
+
+# --- 5. Reshape into wide tables (one per generator) for easy reading, and save to Excel ---
+wide_by_generator <- function(gen_label) {
+  d <- results_long[results_long$generator == gen_label, c("crop","ks_yield","ks_TMX","ks_PRE","ks_GDP","mean_corr_error")]
+  rownames(d) <- NULL
+  d
+}
+pooled_wide <- wide_by_generator("pooled")
+hier_wide   <- wide_by_generator("hierarchical")
+mbb_wide    <- wide_by_generator("mbb")
+
+settings <- data.frame(
+  item = c("run_datetime", "R version", "N_SEEDS", "DEFAULT_SHRINKAGE", "DEFAULT_BLOCK_LEN", "data directory"),
+  value = c(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), R.version.string, N_SEEDS, DEFAULT_SHRINKAGE, DEFAULT_BLOCK_LEN, DATA_DIR)
+)
+
+out_path <- file.path(OUT_DIR, "multivar_fidelity_results.xlsx")
+writexl::write_xlsx(list(
+  "README_settings" = settings,
+  "all_results_long" = results_long,
+  "pooled_wide" = pooled_wide,
+  "hierarchical_wide" = hier_wide,
+  "mbb_wide" = mbb_wide
+), path = out_path)
+
+cat("\n=== DONE. Excel file written to: ===\n", out_path, "\n")
+cat("Please upload this file back.\n")
+
+
+

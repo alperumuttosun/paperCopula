@@ -862,9 +862,13 @@ corr_pooled_within <- do.call(rbind, lapply(CROPS, function(cr) {
              gdp_pooled = round(pooled[1, 4], 3), gdp_within = round(within[1, 4], 3))
 }))
 holdout_countries <- do.call(rbind, lapply(CROPS, function(cr) {
-  d <- load_crop(cr); sp <- split_train_test(d)
-  data.frame(crop = cr, n_countries = length(unique(d$Country_ISO)), n_holdout = length(sp$valid_countries),
-             n_excluded = length(unique(d$Country_ISO)) - length(sp$valid_countries))
+  d <- load_crop(cr); sp <- split_train_test(d); v <- sp$valid_countries
+  m_train <- tapply(sp$train$yield_hg_per_ha, sp$train$Country_ISO, mean)[v]
+  m_test  <- tapply(sp$test$yield_hg_per_ha,  sp$test$Country_ISO,  mean)[v]
+  data.frame(crop = cr, n_countries = length(unique(d$Country_ISO)), n_holdout = length(v),
+             n_excluded = length(unique(d$Country_ISO)) - length(v),
+             median_pct_change_test_vs_train = round(100 * median(m_test / m_train - 1), 1),
+             pct_countries_higher_in_test = round(100 * mean(m_test > m_train), 1))
 }))
 cat("\n=== COPULASTEP7d: median country-level ACF(1) of each variable (real panels) ===\n"); print(acf_by_variable, row.names = FALSE)
 cat("\n=== COPULASTEP7d: pooled vs within-country correlation with yield ===\n"); print(corr_pooled_within, row.names = FALSE)
@@ -876,8 +880,133 @@ write.csv(holdout_countries, file.path(OUT_DIR, "step7d_holdout_countries.csv"),
 
 
 # ============================================================
-# COPULASTEP8 - Collect ALL results into ONE Excel workbook
-# Depends on everything computed in COPULASTEP1-7 above (same R session).
+# COPULASTEP8 - Two additions requested after external review
+#  8a. Held-out DISTRIBUTIONAL fidelity (replaces "one number vs one realized value"):
+#      each generator gives many synthetic futures per country; we score the whole
+#      distribution of synthetic 2015-2024 country means against the realized mean
+#      (CRPS, 95% interval coverage, interval width, bias). Baselines are point
+#      forecasts, so for them CRPS equals the mean absolute error (= MAPE).
+#  8b. ONE downstream check: does a within-country regression of yield on TMX, PRE and
+#      GDP give the same answer on real and on synthetic panels?
+# Depends on everything defined in COPULASTEP1-5 above (same R session).
+# ============================================================
+
+N_SEEDS_STEP8  <- if (QUICK_TEST) 5 else 100   # synthetic futures per country in 8a (100 gives stable 2.5%/97.5% quantiles)
+N_SEEDS_STEP8B <- if (QUICK_TEST) 3 else 30    # synthetic panels per generator in 8b
+PI_LEVEL       <- 0.95                          # central prediction interval used for coverage
+
+# CRPS of an ensemble x (many synthetic values) against one realized value y:
+# mean |x - y| minus half the mean pairwise spread |x_i - x_j| (sorted formula, no double loop)
+crps_ensemble <- function(x, y) {
+  x <- sort(x); n <- length(x)                                   # sort the synthetic draws
+  mean(abs(x - y)) - sum((2 * seq_len(n) - n - 1) * x) / n^2     # CRPS = E|X-y| - 0.5 E|X-X'|
+}
+
+# ---------- 8a: distributional holdout for ONE generator and ONE crop ----------
+holdout_distribution <- function(crop_name, forecast_fun, gen_name) {
+  df <- load_crop(crop_name)                                     # read the crop panel
+  sp <- split_train_test(df)                                     # same train/test split as Step 5
+  v  <- sp$valid_countries                                       # countries with enough train/test years
+  real_m <- tapply(sp$test$yield_hg_per_ha, sp$test$Country_ISO, mean)[v]   # realized 2015-2024 mean per country
+  sims <- sapply(1:N_SEEDS_STEP8, function(s) {                  # one column per synthetic future
+    syn <- forecast_fun(sp, seed = s)                            # generate a synthetic test period
+    tapply(syn$yield_hg_per_ha, syn$Country_ISO, mean)[v]        # its country-level mean yield
+  })                                                             # sims: countries x seeds
+  crps_rel <- sapply(seq_along(v), function(i) crps_ensemble(sims[i, ], real_m[i]) / real_m[i] * 100)  # CRPS in % of realized mean
+  lo <- apply(sims, 1, quantile, probs = (1 - PI_LEVEL) / 2, names = FALSE)       # lower interval bound
+  hi <- apply(sims, 1, quantile, probs = 1 - (1 - PI_LEVEL) / 2, names = FALSE)   # upper interval bound
+  bias_rel <- (rowMeans(sims) - real_m) / real_m * 100           # signed error of the synthetic mean, in %
+  data.frame(
+    crop = crop_name, generator = gen_name, n_countries = length(v),
+    crps_pct         = round(mean(crps_rel), 1),                 # average CRPS (% of realized mean); lower is better
+    coverage_pct     = round(mean(real_m >= lo & real_m <= hi) * 100, 1),   # % of countries whose realized mean is inside the interval
+    real_above_pct   = round(mean(real_m > hi) * 100, 1),        # % of countries where reality is ABOVE the interval (level shift)
+    real_below_pct   = round(mean(real_m < lo) * 100, 1),        # % of countries where reality is BELOW the interval
+    width_pct        = round(mean((hi - lo) / real_m * 100), 1), # average interval width (% of realized mean)
+    bias_pct         = round(mean(bias_rel), 1),                 # average signed bias (negative = synthetic too low)
+    abs_bias_pct     = round(mean(abs(bias_rel)), 1),            # average absolute bias (MAPE of the ensemble mean)
+    stringsAsFactors = FALSE
+  )
+}
+
+# Point baselines scored on the same footing (CRPS of a point forecast = absolute error)
+holdout_baselines <- function(crop_name) {
+  df <- load_crop(crop_name); sp <- split_train_test(df); v <- sp$valid_countries
+  tr <- sp$train[order(sp$train$Country_ISO, sp$train$Yil), ]    # training data in time order
+  real_m <- tapply(sp$test$yield_hg_per_ha, sp$test$Country_ISO, mean)[v]
+  p_mean <- sapply(v, function(c) mean(tr$yield_hg_per_ha[tr$Country_ISO == c]))             # training mean
+  p_last <- sapply(v, function(c) tail(tr$yield_hg_per_ha[tr$Country_ISO == c], 1))          # last training year
+  p_last5 <- sapply(v, function(c) mean(tail(tr$yield_hg_per_ha[tr$Country_ISO == c], 5)))   # mean of last 5 training years
+  one <- function(p, nm) {
+    e <- (p - real_m) / real_m * 100                             # signed % error per country
+    data.frame(crop = crop_name, generator = nm, n_countries = length(v),
+               crps_pct = round(mean(abs(e)), 1), coverage_pct = NA, real_above_pct = NA, real_below_pct = NA,
+               width_pct = NA, bias_pct = round(mean(e), 1), abs_bias_pct = round(mean(abs(e)), 1),
+               stringsAsFactors = FALSE)
+  }
+  rbind(one(p_mean, "baseline_train_mean"), one(p_last, "baseline_last_value"), one(p_last5, "baseline_last5_mean"))
+}
+
+cat("\n=== COPULASTEP8a: held-out distributional fidelity (", N_SEEDS_STEP8, " synthetic futures per country) ===\n", sep = "")
+step8a_list <- lapply(CROPS, function(cr) {
+  rbind(holdout_baselines(cr),
+        holdout_distribution(cr, forecast_pooled,       "pooled_copula"),
+        holdout_distribution(cr, forecast_hierarchical, "hierarchical_copula"),
+        holdout_distribution(cr, forecast_mbb,          "mbb"))
+})
+step8a_results <- do.call(rbind, step8a_list)                    # one row per crop x method
+rownames(step8a_results) <- NULL
+print(step8a_results, row.names = FALSE)
+
+# Average over the 8 crops (simple mean of the crop rows) for the paper's headline numbers
+step8a_summary <- aggregate(cbind(crps_pct, coverage_pct, real_above_pct, real_below_pct, width_pct, bias_pct, abs_bias_pct) ~ generator,
+                            data = step8a_results, FUN = function(x) round(mean(x, na.rm = TRUE), 1), na.action = na.pass)
+cat("\n--- COPULASTEP8a: mean over 8 crops ---\n"); print(step8a_summary, row.names = FALSE)
+write.csv(step8a_results, file.path(OUT_DIR, "step8a_holdout_distribution.csv"), row.names = FALSE)
+write.csv(step8a_summary, file.path(OUT_DIR, "step8a_holdout_summary.csv"), row.names = FALSE)
+
+# ---------- 8b: downstream check, within-country regression ----------
+# Each variable is standardized WITHIN country (std_within), then yield is regressed on
+# TMX, PRE, GDP without intercept = country fixed-effects slopes in standard-deviation units.
+fe_std_coefs <- function(d) {
+  z <- as.data.frame(lapply(d[VARS], std_within, g = d$Country_ISO))     # within-country z-scores
+  z <- z[complete.cases(z), ]                                            # drop countries with zero variance
+  coef(lm(yield_hg_per_ha ~ 0 + TMX_ann + PRE_ann + GDP_per_Capita, data = z))   # 3 slopes
+}
+
+downstream_check <- function(crop_name) {
+  df <- load_crop(crop_name)
+  real_b <- fe_std_coefs(df)                                             # slopes on the REAL panel
+  gens <- list(
+    pooled_copula       = function(s) generate_pooled_copula(df, seed = s),
+    hierarchical_copula = function(s) generate_hierarchical_copula(df, seed = s, shrinkage = DEFAULT_SHRINKAGE),
+    mbb                 = function(s) generate_mbb(df, seed = s, block_len = DEFAULT_BLOCK_LEN))
+  do.call(rbind, lapply(names(gens), function(g) {
+    B <- t(sapply(1:N_SEEDS_STEP8B, function(s) fe_std_coefs(gens[[g]](s)))) # seeds x 3 slopes
+    do.call(rbind, lapply(seq_along(real_b), function(k) {
+      data.frame(crop = crop_name, generator = g, term = names(real_b)[k],
+                 real_slope = round(unname(real_b[k]), 3),                           # slope on real data
+                 syn_slope_mean = round(mean(B[, k]), 3),                    # average slope on synthetic panels
+                 syn_slope_sd = round(sd(B[, k]), 3),                        # seed-to-seed spread
+                 same_sign_pct = round(mean(sign(B[, k]) == sign(unname(real_b[k]))) * 100, 0),   # % of seeds with the real sign
+                 real_in_syn_range = unname(real_b[k] >= quantile(B[, k], 0.025) && real_b[k] <= quantile(B[, k], 0.975)),  # real slope inside synthetic 95% range
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+}
+
+cat("\n=== COPULASTEP8b: within-country regression slopes, real vs synthetic (", N_SEEDS_STEP8B, " panels per generator) ===\n", sep = "")
+step8b_results <- do.call(rbind, lapply(CROPS, downstream_check))
+rownames(step8b_results) <- NULL
+print(step8b_results, row.names = FALSE)
+write.csv(step8b_results, file.path(OUT_DIR, "step8b_downstream_fe.csv"), row.names = FALSE)
+cat("\nCOPULASTEP8 complete.\n")
+
+
+
+# ============================================================
+# COPULASTEP9 - Collect ALL results into ONE Excel workbook
+# Depends on everything computed in COPULASTEP1-8 above (same R session).
 # Upload the resulting .xlsx file to review the full set of numbers in one place.
 # ============================================================
 
@@ -893,13 +1022,13 @@ settings <- data.frame(
   item = c("run_datetime", "QUICK_TEST (TRUE = few seeds, not paper numbers)", "R version", "readxl version", "writexl version",
            "data directory", "output directory", "crops",
            "seeds step2 (pooled copula)", "seeds step3 (hierarchical copula)", "seeds step4 (MBB)",
-           "seeds step5 (temporal holdout)", "seeds step7 (tiers, bias correction)", "seeds step7c (variance ratio)",
+           "seeds step5 (temporal holdout)", "seeds step7 (tiers, bias correction)", "seeds step7c (variance ratio)", "seeds step8a (distributional holdout)", "seeds step8b (downstream regression)",
            "bootstrap resamples step7", "DEFAULT_SHRINKAGE (hierarchical AR(1))", "DEFAULT_BLOCK_LEN (MBB, years)",
            "TRAIN_CUTOFF (last training year)", "history tiers (years)"),
   value = c(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), as.character(QUICK_TEST), R.version.string,
             as.character(utils::packageVersion("readxl")), as.character(utils::packageVersion("writexl")),
             DATA_DIR, OUT_DIR, paste(CROPS, collapse = ", "),
-            N_SEEDS_STEP2, N_SEEDS_STEP3, N_SEEDS_STEP4, N_SEEDS_STEP5, N_SEEDS_STEP7, N_SEEDS_STEP7C,
+            N_SEEDS_STEP2, N_SEEDS_STEP3, N_SEEDS_STEP4, N_SEEDS_STEP5, N_SEEDS_STEP7, N_SEEDS_STEP7C, N_SEEDS_STEP8, N_SEEDS_STEP8B,
             N_BOOT_STEP7, DEFAULT_SHRINKAGE, DEFAULT_BLOCK_LEN, TRAIN_CUTOFF, paste(TIER_LABELS, collapse = " | ")),
   stringsAsFactors = FALSE
 )
@@ -909,7 +1038,7 @@ sheet_index <- data.frame(
             "4a_blocklen_sweep_wheat", "5_temporal_holdout", "6_sig_between_share", "6_sig_acf1",
             "6_sig_temporal_mape", "6_master_table", "7_tier_summary", "7_per_crop_tier", "7_country_level",
             "7b_bias_correction", "7c_within_variance", "7d_acf_by_variable", "7d_corr_pooled_vs_within",
-            "7d_holdout_countries", "files_in_output_folder"),
+            "7d_holdout_countries", "8a_holdout_distribution", "8a_holdout_summary", "8b_downstream_fe", "files_in_output_folder"),
   contents = c("Real-data reference statistics per crop (T_i, between-country share, ACF(1), correlations)",
                "Pooled Gaussian copula: KS, between-country share, median ACF(1); mean and SD over seeds",
                "Hierarchical copula + AR(1) at the default shrinkage: same metrics",
@@ -928,7 +1057,10 @@ sheet_index <- data.frame(
                "Generated / real within-country yield variance ratio",
                "Median country-level ACF(1) of yield, TMX, PRE, GDP in the real panels (no seeds)",
                "Pooled vs within-country correlation of yield with TMX, PRE, GDP (Simpson check; no seeds)",
-               "Countries used in the temporal holdout, per crop (no seeds)",
+               "Countries used in the temporal holdout, per crop, and the shift in mean yield from 1961-2014 to 2015-2024 (no seeds)",
+               "Distributional holdout per crop: CRPS, 95% coverage, share of realized means above/below the interval, interval width, bias; baselines scored as point forecasts",
+               "Distributional holdout averaged over the 8 crops",
+               "Within-country regression slopes (yield on TMX, PRE, GDP; SD units): real vs synthetic panels",
                "List of every file (csv, png, pdf) written to the output folder"),
   manuscript = c("Table 1; Section 4.1", "Section 4.2; Appendix Table A3", "Section 4.3; Appendix Table A3",
                  "Appendix Table A1", "Section 4.3; Appendix Table A3", "Appendix Table A2",
@@ -936,7 +1068,7 @@ sheet_index <- data.frame(
                  "Section 3.3 (significance)", "Appendix Tables A3-A4", "Section 4.5, Table 2",
                  "Section 4.5, Figure 4; Appendix Table A5", "Section 4.5", "Section 4.5; Appendix Table A6",
                  "Section 4.5; Appendix Table A6", "Section 3.1; Appendix Table A7", "Section 5; Appendix Table A8",
-                 "Sections 3.3 and 4.4", ""),
+                 "Sections 3.3 and 4.4", "Section 4.4 (revised)", "Section 4.4 (revised)", "Section 4.7 (new)", ""),
   stringsAsFactors = FALSE
 )
 
@@ -967,189 +1099,10 @@ all_sheets <- list(
   "7d_acf_by_variable"       = acf_by_variable,
   "7d_corr_pooled_vs_within" = corr_pooled_within,
   "7d_holdout_countries"     = holdout_countries,
+  "8a_holdout_distribution"  = step8a_results,
+  "8a_holdout_summary"       = step8a_summary,
+  "8b_downstream_fe"         = step8b_results,
   "files_in_output_folder"   = files_now
 )
 writexl::write_xlsx(all_sheets, path = xlsx_path)
-cat("\n=== COPULASTEP8: Excel workbook written ===\n", xlsx_path, "\n", length(all_sheets), " sheets. Upload this file to review all results.\n", sep = "")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ============================================================
-# COPULASTEP_MULTIVAR - Multivariate fidelity check (all 4 variables, not just yield)
-# Self-contained: does not depend on any other script. Just run this file alone.
-# Produces ONE Excel file: multivar_fidelity_results.xlsx
-# ============================================================
-
-# --- 0. Data directory: try base_dir1 first, fall back to base_dir2 ---
-base_dir1 <- "C:/Users/Alper.Tosun/Desktop/cru130"
-base_dir2 <- "C:/Users/autos/OneDrive/Desktop/cru130"
-if (dir.exists(base_dir1)) {
-  DATA_DIR <- base_dir1
-} else if (dir.exists(base_dir2)) {
-  DATA_DIR <- base_dir2
-} else {
-  stop("Neither base_dir1 nor base_dir2 exists. Please check the panel file location.")
-}
-OUT_DIR <- file.path(DATA_DIR, "copulapaper")
-if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
-cat("Using data directory:", DATA_DIR, "\n")
-cat("Output directory:", OUT_DIR, "\n")
-
-if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
-if (!requireNamespace("writexl", quietly = TRUE)) install.packages("writexl")
-
-CROPS <- c("wheat","barley","maize","oats","rice","rye","sorghum","soybean")
-VARS  <- c("yield_hg_per_ha", "TMX_ann", "PRE_ann", "GDP_per_Capita")
-N_SEEDS <- 50                       # same replication count as the main paper results
-DEFAULT_SHRINKAGE  <- 1.0           # matches the paper's chosen hierarchical-copula default
-DEFAULT_BLOCK_LEN  <- 8             # matches the paper's chosen MBB default
-
-# --- 1. Load one crop's panel file (.xlsx) ---
-load_crop <- function(crop_name) {
-  path <- file.path(DATA_DIR, paste0("panelv7_", crop_name, ".xlsx"))
-  df <- as.data.frame(readxl::read_excel(path))
-  df$GDP_per_Capita[is.na(df$GDP_per_Capita)] <- median(df$GDP_per_Capita, na.rm = TRUE)
-  df
-}
-
-# Standardizes a variable WITHIN each country (used to estimate cross-variable dependence
-# without confounding it with between-country level differences)
-std_within <- function(x, g) ave(x, g, FUN = function(v) {
-  s <- sd(v); if (is.na(s) || s == 0) return(rep(NA, length(v))); (v - mean(v)) / s
-})
-safe_chol <- function(R) tryCatch(chol(R), error = function(e) chol(R + diag(1e-6, ncol(R))))
-acf1_by_country <- function(x, g) sapply(split(x, g), function(v) if (length(v) < 5) NA else acf(v, plot = FALSE, lag.max = 1)$acf[2])
-
-to_normal_scores <- function(x) qnorm(rank(x, ties.method = "average") / (length(x) + 1))
-inverse_ecdf <- function(u, original_x) quantile(original_x, probs = pmin(pmax(u, 1e-6), 1 - 1e-6), type = 7, names = FALSE)
-
-# --- 2. The three generators (identical specification to the main paper) ---
-
-generate_pooled_copula <- function(df, seed) {
-  set.seed(seed)
-  n <- nrow(df)
-  Z <- as.data.frame(lapply(df[VARS], to_normal_scores))
-  R <- cor(Z); L <- safe_chol(R)
-  Znew <- matrix(rnorm(n * length(VARS)), nrow = n) %*% L; colnames(Znew) <- VARS
-  syn <- as.data.frame(lapply(VARS, function(v) inverse_ecdf(pnorm(Znew[, v]), df[[v]])))
-  colnames(syn) <- VARS
-  syn$Country_ISO <- df$Country_ISO
-  syn
-}
-
-generate_hierarchical_copula <- function(df, seed, shrinkage = DEFAULT_SHRINKAGE) {
-  set.seed(seed)
-  Zw <- as.data.frame(lapply(df[VARS], std_within, g = df$Country_ISO))
-  R <- cor(Zw, use = "pairwise.complete.obs"); L <- safe_chol(R)
-  acf1_mat <- sapply(VARS, function(v) acf1_by_country(df[[v]], df$Country_ISO))
-  gen_one <- function(cid) {
-    sub <- df[df$Country_ISO == cid, ]; Ti <- nrow(sub)
-    means <- sapply(sub[VARS], mean); sds <- sapply(sub[VARS], sd)
-    phi_vec <- shrinkage * ifelse(is.na(acf1_mat[cid, ]), 0, acf1_mat[cid, ])
-    eps <- matrix(rnorm(Ti * length(VARS)), nrow = Ti) %*% L
-    X <- matrix(0, nrow = Ti, ncol = length(VARS)); X[1, ] <- eps[1, ]
-    if (Ti > 1) for (t in 2:Ti) X[t, ] <- phi_vec * X[t-1, ] + sqrt(pmax(1 - phi_vec^2, 0.01)) * eps[t, ]
-    Xs <- sweep(sweep(X, 2, sds, `*`), 2, means, `+`); colnames(Xs) <- VARS
-    data.frame(Country_ISO = cid, Xs)
-  }
-  syn <- do.call(rbind, lapply(unique(df$Country_ISO), gen_one))
-  syn$yield_hg_per_ha[syn$yield_hg_per_ha <= 0] <- 1
-  syn
-}
-
-generate_mbb <- function(df, seed, block_len = DEFAULT_BLOCK_LEN) {
-  set.seed(seed)
-  mbb_one <- function(sub) {
-    Ti <- nrow(sub)
-    if (Ti <= block_len) return(sub[sample(1:Ti, Ti, replace = TRUE), ])
-    n_blocks <- ceiling(Ti / block_len)
-    starts <- sample(1:(Ti - block_len + 1), n_blocks, replace = TRUE)
-    idx <- unlist(lapply(starts, function(s) s:(s + block_len - 1)))[1:Ti]
-    sub[idx, ]
-  }
-  do.call(rbind, lapply(split(df, df$Country_ISO), mbb_one))
-}
-
-# --- 3. Fidelity metrics for ALL FOUR variables (not just yield) ---
-
-# KS statistic per variable
-ks_all_vars <- function(df_real, df_syn) {
-  sapply(VARS, function(v) unname(suppressWarnings(ks.test(df_real[[v]], df_syn[[v]])$statistic)))
-}
-
-# Cross-variable correlation error: mean absolute difference between the real and synthetic
-# pooled correlation matrices, averaged over the 6 off-diagonal variable pairs
-corr_error <- function(df_real, df_syn) {
-  R_real <- cor(df_real[VARS]); R_syn <- cor(df_syn[VARS])
-  idx <- upper.tri(R_real)
-  mean(abs(R_real[idx] - R_syn[idx]))
-}
-
-run_multivar_fidelity <- function(crop_name, generator_fun, generator_label, ...) {
-  df <- load_crop(crop_name)
-  results <- lapply(1:N_SEEDS, function(s) {
-    syn <- generator_fun(df, seed = s, ...)
-    c(ks_all_vars(df, syn), corr_error = corr_error(df, syn))
-  })
-  m <- rowMeans(do.call(cbind, results))
-  data.frame(crop = crop_name, generator = generator_label,
-             ks_yield = round(m["yield_hg_per_ha"], 4), ks_TMX = round(m["TMX_ann"], 4),
-             ks_PRE = round(m["PRE_ann"], 4), ks_GDP = round(m["GDP_per_Capita"], 4),
-             mean_corr_error = round(m["corr_error"], 4))
-}
-
-# --- 4. Run for all 8 crops x 3 generators ---
-cat("\nRunning multivariate fidelity check (", N_SEEDS, " seeds per crop/generator)...\n", sep = "")
-all_results <- list()
-for (cr in CROPS) {
-  cat("  ", cr, "...\n")
-  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_pooled_copula, "pooled")
-  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_hierarchical_copula, "hierarchical")
-  all_results[[length(all_results) + 1]] <- run_multivar_fidelity(cr, generate_mbb, "mbb")
-}
-results_long <- do.call(rbind, all_results)
-cat("\n=== Multivariate fidelity results (all crops, all generators) ===\n")
-print(results_long, row.names = FALSE)
-
-# --- 5. Reshape into wide tables (one per generator) for easy reading, and save to Excel ---
-wide_by_generator <- function(gen_label) {
-  d <- results_long[results_long$generator == gen_label, c("crop","ks_yield","ks_TMX","ks_PRE","ks_GDP","mean_corr_error")]
-  rownames(d) <- NULL
-  d
-}
-pooled_wide <- wide_by_generator("pooled")
-hier_wide   <- wide_by_generator("hierarchical")
-mbb_wide    <- wide_by_generator("mbb")
-
-settings <- data.frame(
-  item = c("run_datetime", "R version", "N_SEEDS", "DEFAULT_SHRINKAGE", "DEFAULT_BLOCK_LEN", "data directory"),
-  value = c(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), R.version.string, N_SEEDS, DEFAULT_SHRINKAGE, DEFAULT_BLOCK_LEN, DATA_DIR)
-)
-
-out_path <- file.path(OUT_DIR, "multivar_fidelity_results.xlsx")
-writexl::write_xlsx(list(
-  "README_settings" = settings,
-  "all_results_long" = results_long,
-  "pooled_wide" = pooled_wide,
-  "hierarchical_wide" = hier_wide,
-  "mbb_wide" = mbb_wide
-), path = out_path)
-
-cat("\n=== DONE. Excel file written to: ===\n", out_path, "\n")
-cat("Please upload this file back.\n")
-
-
-
+cat("\n=== COPULASTEP9: Excel workbook written ===\n", xlsx_path, "\n", length(all_sheets), " sheets. Upload this file to review all results.\n", sep = "")

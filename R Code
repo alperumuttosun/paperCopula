@@ -288,7 +288,7 @@ cat("\nFigure saved: step2_fig1_between_country_pooled.png (1600 dpi) and .pdf\n
 
 
 # ============================================================
-# COPULASTEP3 - Generator B: hierarchical (country-conditioned) copula + AR(1)
+# COPULASTEP3 - Generator B: country-conditioned Gaussian AR(1) generator, "CC-AR(1)" in the paper (object names keep "hierarchical")
 # Depends on everything defined in COPULASTEP1 and COPULASTEP2 above.
 # ============================================================
 
@@ -358,7 +358,7 @@ run_hierarchical_multiseed <- function(crop_name, shrinkage) {
 DEFAULT_SHRINKAGE <- 1.0
 
 step3_results <- do.call(rbind, lapply(CROPS, run_hierarchical_multiseed, shrinkage = DEFAULT_SHRINKAGE))
-cat("\n=== COPULASTEP3: Hierarchical copula + AR(1), shrinkage=", DEFAULT_SHRINKAGE, ", ", N_SEEDS_STEP3, "-seed average ===\n", sep = "")
+cat("\n=== COPULASTEP3: CC-AR(1) generator (country-conditioned Gaussian AR(1)), shrinkage=", DEFAULT_SHRINKAGE, ", ", N_SEEDS_STEP3, "-seed average ===\n", sep = "")
 print(step3_results, row.names = FALSE)
 write.csv(step3_results, file.path(OUT_DIR, "step3_hierarchical_copula_results.csv"), row.names = FALSE)
 
@@ -374,7 +374,7 @@ save_figure(function() {
   m <- rbind(reference_table$acf1_median, step3_results$acf1_median_mean)
   draw_grouped_bars(m, styles = c("solid", "hatch"), group_labels = reference_table$crop,
                      ylab = "Median country-level ACF(1) of yield", ylim = c(0, 1),
-                     legend_labels = c("Real data", "Hierarchical copula (50-seed mean)"))
+                     legend_labels = c("Real data", "CC-AR(1) generator (50-seed mean)"))
 }, filename = "step3_fig1_acf1_hierarchical", width_in = 8, height_in = 5)
 
 cat("\nSaved: step3_hierarchical_copula_results.csv, step3_shrinkage_sensitivity_wheat.csv,",
@@ -442,7 +442,7 @@ save_figure(function() {
   m <- rbind(reference_table$acf1_median, step3_results$acf1_median_mean, step4_results$acf1_median_mean)
   draw_grouped_bars(m, styles = c("solid", "hatch", "cross"), group_labels = reference_table$crop,
                      ylab = "Median country-level ACF(1) of yield", ylim = c(0, 1),
-                     legend_labels = c("Real data", "Hierarchical copula", "Moving Block Bootstrap"))
+                     legend_labels = c("Real data", "CC-AR(1) generator", "Moving Block Bootstrap"))
 }, filename = "step4_fig1_acf1_three_generators", width_in = 8, height_in = 5)
 
 cat("\nSaved: step4_blocklen_sensitivity_wheat.csv, step4_mbb_results.csv,",
@@ -586,7 +586,7 @@ save_figure(function() {
   draw_grouped_bars(m, styles = c("solid", "horiz", "hatch", "cross", "vert"), group_labels = step5_results$crop,
                      ylab = "Temporal holdout MAPE (%)", ylim = c(0, max(m) * 1.45),
                      legend_labels = c("Naive (train mean)", "Last observed value", "Pooled copula",
-                                       "Hierarchical copula", "MBB"))
+                                       "CC-AR(1) generator", "MBB"))
 }, filename = "step5_fig1_temporal_holdout_mape", width_in = 8, height_in = 5)
 
 cat("\nSaved: step5_temporal_holdout_results.csv, step5_fig1_temporal_holdout_mape.png/.pdf\n")
@@ -669,7 +669,7 @@ write.csv(master_table, file.path(OUT_DIR, "step6_master_table.csv"), row.names 
 # --- Figure: 95% CI plot (error bars) for between-country share, wheat, all 3 generators ---
 # Single crop (wheat) -> same wheat color throughout; pattern distinguishes the 3 generators.
 save_figure(function() {
-  gens <- c("Pooled", "Hierarchical", "MBB")
+  gens <- c("Pooled", "CC-AR(1)", "MBB")
   est  <- c(step2_results$between_share_mean[1], step3_results$between_share_mean[1], step4_results$between_share_mean[1])
   se   <- c(step2_results$between_share_sd[1]/sqrt(N_SEEDS_STEP2), step3_results$between_share_sd[1]/sqrt(N_SEEDS_STEP3), step4_results$between_share_sd[1]/sqrt(N_SEEDS_STEP4))
   bar_w <- 0.8; gap <- 0.3
@@ -1012,7 +1012,7 @@ save_figure(function() {
   par(mar = c(0.8, 4.5, 1, 1))                           # top panel margins (no x labels)
   draw_grouped_bars(m_crps, styles = c("solid", "horiz", "hatch", "cross", "vert"), group_labels = CROPS,
                     ylab = "CRPS (%)", ylim = c(0, 80), show_x = FALSE,
-                    legend_labels = c("Naive (train mean)", "Last observed value", "Pooled copula", "Hierarchical copula", "MBB"))
+                    legend_labels = c("Naive (train mean)", "Last observed value", "Pooled copula", "CC-AR(1) generator", "MBB"))
   par(mar = c(6, 4.5, 0.8, 1))                           # bottom panel margins (room for crop names)
   draw_grouped_bars(m_cov, styles = c("hatch", "cross", "vert"), group_labels = CROPS,
                     ylab = "95% coverage (%)", ylim = c(0, 110), show_x = TRUE)
@@ -1061,7 +1061,7 @@ sheet_index <- data.frame(
             "7d_holdout_countries", "8a_holdout_distribution", "8a_holdout_summary", "8b_downstream_fe", "files_in_output_folder"),
   contents = c("Real-data reference statistics per crop (T_i, between-country share, ACF(1), correlations)",
                "Pooled Gaussian copula: KS, between-country share, median ACF(1); mean and SD over seeds",
-               "Hierarchical copula + AR(1) at the default shrinkage: same metrics",
+               "CC-AR(1) generator at the default shrinkage: same metrics",
                "AR(1) shrinkage sensitivity sweep (wheat)",
                "Moving block bootstrap at the chosen block length: same metrics",
                "MBB block-length sensitivity sweep (wheat)",
@@ -1073,7 +1073,7 @@ sheet_index <- data.frame(
                "ACF(1) error by history-length tier, 8 crops pooled (with noise floor)",
                "Per-crop ACF(1) error by history-length tier (hierarchical copula)",
                "Country-level ACF(1) errors (real vs hierarchical, MBB, AR(1) noise floor)",
-               "Hierarchical copula with vs without small-sample bias correction of phi",
+               "CC-AR(1) generator with vs without small-sample bias correction of phi",
                "Generated / real within-country yield variance ratio",
                "Median country-level ACF(1) of yield, TMX, PRE, GDP in the real panels (no seeds)",
                "Pooled vs within-country correlation of yield with TMX, PRE, GDP (Simpson check; no seeds)",

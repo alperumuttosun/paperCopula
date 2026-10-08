@@ -66,12 +66,12 @@ crop_colors <- c(
 # mat: a series x crop matrix of values. styles: a character vector (one per series/row),
 # e.g. c("solid", "hatch", "cross"). group_labels: crop names (columns). Base R only.
 draw_grouped_bars <- function(mat, styles, group_labels, ylab, xlab = "Crop", ylim = c(0, 1),
-                               legend_labels = NULL, legend_pos = "topright") {
+                               legend_labels = NULL, legend_pos = "topright", show_x = TRUE) {
   n_series <- nrow(mat); n_groups <- ncol(mat)
   bar_w <- 0.8; group_gap <- 0.6
   group_w <- n_series * bar_w
   plot(NULL, xlim = c(0, n_groups * (group_w + group_gap)), ylim = ylim,
-       xlab = xlab, ylab = ylab, xaxt = "n", bty = "l")
+       xlab = if (show_x) xlab else "", ylab = ylab, xaxt = "n", bty = "l")   # show_x = FALSE hides the x label (for stacked panels)
   group_centers <- numeric(n_groups)
   for (g in 1:n_groups) {
     x0 <- (g - 1) * (group_w + group_gap)
@@ -103,7 +103,7 @@ draw_grouped_bars <- function(mat, styles, group_labels, ylab, xlab = "Crop", yl
     }
     group_centers[g] <- x0 + group_w / 2
   }
-  axis(1, at = group_centers, labels = group_labels, las = 2)
+  if (show_x) axis(1, at = group_centers, labels = group_labels, las = 2)   # crop names only on the bottom panel
   if (!is.null(legend_labels)) {
     # Hand-drawn legend: each swatch repeats EXACTLY the bar pattern (same angles and line spacing) in
     # black with heavier lines, so solid / diagonal stripes / crosshatch / vertical / horizontal lines
@@ -1000,6 +1000,26 @@ step8b_results <- do.call(rbind, lapply(CROPS, downstream_check))
 rownames(step8b_results) <- NULL
 print(step8b_results, row.names = FALSE)
 write.csv(step8b_results, file.path(OUT_DIR, "step8b_downstream_fe.csv"), row.names = FALSE)
+
+# ---------- 8c: Figure 3 of the paper = CRPS (top) + 95% coverage (bottom), one shared x axis ----------
+pick8a <- function(gen, col) sapply(CROPS, function(cn) step8a_results[[col]][step8a_results$crop == cn & step8a_results$generator == gen])  # one value per crop
+m_crps <- rbind(pick8a("baseline_train_mean", "crps_pct"), pick8a("baseline_last_value", "crps_pct"),
+                pick8a("pooled_copula", "crps_pct"), pick8a("hierarchical_copula", "crps_pct"), pick8a("mbb", "crps_pct"))   # 5 methods x 8 crops
+m_cov  <- rbind(pick8a("pooled_copula", "coverage_pct"), pick8a("hierarchical_copula", "coverage_pct"), pick8a("mbb", "coverage_pct"))   # 3 generators x 8 crops
+
+save_figure(function() {
+  par(mfrow = c(2, 1))                                   # two panels stacked
+  par(mar = c(0.8, 4.5, 1, 1))                           # top panel margins (no x labels)
+  draw_grouped_bars(m_crps, styles = c("solid", "horiz", "hatch", "cross", "vert"), group_labels = CROPS,
+                    ylab = "CRPS (%)", ylim = c(0, 80), show_x = FALSE,
+                    legend_labels = c("Naive (train mean)", "Last observed value", "Pooled copula", "Hierarchical copula", "MBB"))
+  par(mar = c(6, 4.5, 0.8, 1))                           # bottom panel margins (room for crop names)
+  draw_grouped_bars(m_cov, styles = c("hatch", "cross", "vert"), group_labels = CROPS,
+                    ylab = "95% coverage (%)", ylim = c(0, 110), show_x = TRUE)
+  abline(h = 95, lty = 2)                                # dashed line = nominal 95% coverage
+}, filename = "step8c_fig1_holdout_distribution", width_in = 8, height_in = 5)
+cat("\nSaved: step8c_fig1_holdout_distribution.png (1600 dpi) and .pdf\n")
+
 cat("\nCOPULASTEP8 complete.\n")
 
 

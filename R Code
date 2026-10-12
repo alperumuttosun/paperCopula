@@ -1147,6 +1147,46 @@ cat("\n=== COPULASTEP9: Excel workbook written ===\n", xlsx_path, "\n", length(a
 
 
 
+# Teorik (mekanik) ic-ulke varyans orani: AR(1) uretici, populasyon sd = gercek ornek sd iken
+# uretilen serinin ORNEK varyansinin beklenen oranini hesaplar ve Tablo A5 ile karsilastirir.
+library(readxl)                                   # xlsx okumak icin
+cands <- c("C:/Users/Alper.Tosun/Desktop/cru130",                 # ana bilgisayar (copulastep ile ayni)
+           "C:/Users/autos/OneDrive/Desktop/cru130")               # yedek bilgisayar
+panel_dir <- cands[dir.exists(cands)][1]                           # var olan ilk klasoru sec
+if (is.na(panel_dir)) stop("cru130 klasoru bulunamadi: panel_dir'i elle yazin")   # klasor yoksa dur
+res_file  <- file.path(panel_dir, "copulapaper", "copulapaper_results.xlsx")       # copulastep ciktisi
+crops <- c("wheat","barley","maize","oats","rice","rye","sorghum","soybean")   # 8 urun
+
+# E[s^2]/sigma^2 = 1 - 2/(T-1) * sum_{k=1}^{T-1} (1 - k/T) * phi^k   (AR(1), ornek ortalama cikarilmis)
+exp_ratio <- function(phi, T) {
+  k <- 1:(T - 1)                                  # gecikmeler
+  1 - 2 / (T - 1) * sum((1 - k / T) * phi^k)      # beklenen oran
+}
+
+out <- do.call(rbind, lapply(crops, function(cr) {
+  d <- read_excel(file.path(panel_dir, paste0("panelv7_", cr, ".xlsx")))      # urun paneli
+  r <- do.call(rbind, lapply(split(d$yield_hg_per_ha, d$Country_ISO), function(y) {
+    y <- y[!is.na(y)]; T <- length(y)             # ulke serisi ve uzunlugu
+    if (T < 3) return(NULL)                       # cok kisa serileri atla
+    phi <- acf(y, plot = FALSE, lag.max = 1)$acf[2]            # ulkenin ACF(1) degeri (R varsayilani)
+    phi_bc <- min(phi + (1 + 3 * phi) / T, 0.98)               # bias-corrected phi (kodla ayni)
+    c(theory = exp_ratio(phi, T), theory_bc = exp_ratio(phi_bc, T), phi_bc = phi_bc)
+  }))
+  data.frame(crop = cr, theory = mean(r[, "theory"]), theory_bc = mean(r[, "theory_bc"]),
+             min_phi_bc = min(r[, "phi_bc"]))        # ulke ortalamasi ve alt sinir kontrolu
+}))
+obs <- read_excel(res_file, sheet = "7c_within_variance")      # Tablo A5'teki simulasyon sonuclari
+out <- merge(out, obs, by = "crop")                # teori ile simulasyonu birlestir
+print(round(out[, -1], 3)); write.csv(out, "variance_check.csv", row.names = FALSE)   # yazdir ve kaydet
+
+
+
+
+
+
+
+
+
 
 
 

@@ -515,15 +515,25 @@ forecast_hierarchical <- function(sp, seed, shrinkage = DEFAULT_SHRINKAGE) {
   do.call(rbind, lapply(sp$valid_countries, gen_one))
 }
 
-# --- Forecast C: Moving Block Bootstrap --- resample blocks from each country's OWN training
-# history to fill the test period ("historical analog" forecast; cannot represent a trend
-# that lies outside the training period's observed range)
+# --- Forecast C: Moving Block Bootstrap --- resample CONTIGUOUS BLOCKS (length DEFAULT_BLOCK_LEN) from
+# each country's OWN training history, in year order, until the test-period length is filled
+# ("historical analog" forecast; cannot represent a trend that lies outside the training range).
+# FIX (review round): the previous version resampled single years i.i.d. and ignored block_len,
+# which did not match the in-sample MBB generator (generate_mbb) or the paper's description.
 forecast_mbb <- function(sp, seed, block_len = DEFAULT_BLOCK_LEN) {
   set.seed(seed)
   gen_one <- function(cid) {
     sub_tr <- sp$train[sp$train$Country_ISO == cid, ]
-    Ti <- sum(sp$test$Country_ISO == cid)
-    idx <- sample(1:nrow(sub_tr), Ti, replace = TRUE)   # simple i.i.d. resample from train years
+    sub_tr <- sub_tr[order(sub_tr$Yil), ]                       # blocks must follow calendar order
+    Ti <- sum(sp$test$Country_ISO == cid)                        # number of years to generate
+    n  <- nrow(sub_tr)
+    if (n <= block_len) {                                        # history shorter than one block: plain resample
+      idx <- sample(1:n, Ti, replace = TRUE)
+    } else {
+      n_blocks <- ceiling(Ti / block_len)                        # blocks needed to fill the test window
+      starts <- sample(1:(n - block_len + 1), n_blocks, replace = TRUE)   # random block start years
+      idx <- unlist(lapply(starts, function(s0) s0:(s0 + block_len - 1)))[1:Ti]   # concatenate, trim to Ti
+    }
     data.frame(Country_ISO = cid, sub_tr[idx, VARS])
   }
   do.call(rbind, lapply(sp$valid_countries, gen_one))
